@@ -3,14 +3,8 @@
 
 """
 PaquetesAndreaniBot.py
-Versión corregida — soporta:
-- aceptar '1', 'paquete' -> suma 1
-- aceptar '-1' -> resta 1 (no baja de 0)
-- /resetdia -> elimina la jornada del día (solo owners)
-- inline buttons: +1, -1, eliminar jornada, finalizar, iniciar, mes
-- hasta 2 owners
-- /day [DD/MM/YY|DD/MM/YYYY] para ver resumen de cualquier día
-Compatible con python-telegram-bot==13.15
+Bot de conteo de paquetes - versión final solicitada.
+Compatible con python-telegram-bot==13.15 (sincrónico).
 """
 
 import os
@@ -67,7 +61,7 @@ def init_db():
         """
     )
 
-    # Tabla config (guardaremos owner1 y owner2)
+    # Tabla config (owner1, owner2)
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS config (
@@ -110,8 +104,8 @@ def get_owner_ids():
 
 def add_owner_id(uid: int) -> bool:
     """
-    Intenta agregar un owner. Devuelve True si se agregó o ya existía.
-    Devuelve False si no hay espacio (ya hay 2 owners).
+    Agrega uid como owner1 o owner2 si hay espacio.
+    Devuelve True si el uid fue agregado o ya existía; False si no hay espacio.
     """
     ids = get_owner_ids()
     if uid in ids:
@@ -180,8 +174,8 @@ def start_day(uid: int, date: str) -> bool:
 def add_package(uid: int, date: str, amount: int = 1) -> Optional[int]:
     """
     Añade (o resta si amount negativo) paquetes a la jornada del día.
-    Devuelve el nuevo total de paquetes, None si no hay jornada, o False si ya fue finalizada.
-    Se asegura de no bajar de 0 paquetes.
+    Devuelve el nuevo total de paquetes (int), None si no hay jornada, o False si ya fue finalizada.
+    No permite bajar de 0 paquetes.
     """
     conn = get_conn()
     c = conn.cursor()
@@ -194,7 +188,7 @@ def add_package(uid: int, date: str, amount: int = 1) -> Optional[int]:
         conn.close()
         return False
     current = r[1]
-    new_val = current + int(amount)
+    new_val = int(current) + int(amount)
     if new_val < 0:
         new_val = 0
     c.execute("UPDATE days SET packages = ? WHERE id=?", (new_val, r[0]))
@@ -204,9 +198,6 @@ def add_package(uid: int, date: str, amount: int = 1) -> Optional[int]:
 
 
 def delete_day(uid: int, date: str) -> bool:
-    """
-    Elimina la fila de la jornada del día para el usuario. Devuelve True si borró algo.
-    """
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id FROM days WHERE user_id=? AND date=?", (uid, date))
@@ -255,12 +246,13 @@ def get_month_summary(uid: int, year: int, month: int):
 # ---------------- Keyboards ----------------
 def make_keyboard(active: bool = False) -> ReplyKeyboardMarkup:
     if active:
-        keys = [[KeyboardButton("1"), KeyboardButton("-1"), KeyboardButton("paquete")],
-                [KeyboardButton("/finalizar"), KeyboardButton("/resetdia")],
-                [KeyboardButton("/mes"), KeyboardButton("/info")]]
+        keys = [
+            [KeyboardButton("1"), KeyboardButton("-1"), KeyboardButton("paquete")],
+            [KeyboardButton("/finalizar"), KeyboardButton("/resetdia")],
+            [KeyboardButton("/mes"), KeyboardButton("/info")],
+        ]
     else:
-        keys = [[KeyboardButton("/iniciar")],
-                [KeyboardButton("/mes"), KeyboardButton("/info")]]
+        keys = [[KeyboardButton("/iniciar")], [KeyboardButton("/mes"), KeyboardButton("/info")]]
     return ReplyKeyboardMarkup(keys, resize_keyboard=True)
 
 
@@ -273,10 +265,7 @@ def make_inline_keyboard(active: bool = False) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📅 Resumen mes", callback_data="mes")],
         ]
     else:
-        buttons = [
-            [InlineKeyboardButton("🚀 Iniciar jornada", callback_data="iniciar")],
-            [InlineKeyboardButton("📅 Resumen mes", callback_data="mes")],
-        ]
+        buttons = [[InlineKeyboardButton("🚀 Iniciar jornada", callback_data="iniciar")], [InlineKeyboardButton("📅 Resumen mes", callback_data="mes")]]
     return InlineKeyboardMarkup(buttons)
 
 
@@ -323,7 +312,6 @@ def cmd_iniciar(update: Update, context: CallbackContext):
     ok = start_day(uid, hoy)
     if ok:
         update.message.reply_text(f"Cristian, jornada iniciada para {hoy}.", reply_markup=make_keyboard(True))
-        # also show inline keyboard
         update.message.reply_text("Acciones rápidas:", reply_markup=make_inline_keyboard(True))
     else:
         update.message.reply_text("Ya hay una jornada iniciada para hoy.", reply_markup=make_keyboard(True))
@@ -396,6 +384,26 @@ def cmd_resetdia(update: Update, context: CallbackContext):
         update.message.reply_text("Jornada del día eliminada. Puedes iniciar otra con /iniciar.", reply_markup=make_keyboard(False))
     else:
         update.message.reply_text("No había jornada para eliminar.", reply_markup=make_keyboard(False))
+
+
+# ---------------- Shutdown ----------------
+def cmd_apagarbot(update: Update, context: CallbackContext):
+    uid = update.message.from_user.id
+    if not is_owner(uid):
+        update.message.reply_text("No estás autorizado para apagar el bot.")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⚠️ Confirmar apagar bot ⚠️", callback_data="confirm_shutdown")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="cancel_shutdown")],
+        ]
+    )
+    update.message.reply_text(
+        "⚠️ *PELIGRO*\nSi confirmás, el bot se APAGARÁ completamente. ¿Estás seguro?",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
 
 
 # ---------------- Callbacks (inline) ----------------
@@ -519,10 +527,6 @@ def handle_text(update: Update, context: CallbackContext):
 
 # ---------------- Day command ----------------
 def parse_date_arg(date_arg: str) -> Optional[str]:
-    """
-    Parse DD/MM/YY or DD/MM/YYYY and return 'YYYY-MM-DD'
-    If parsing fails, return None.
-    """
     try:
         parts = date_arg.strip().split("/")
         if len(parts) != 3:
@@ -530,7 +534,7 @@ def parse_date_arg(date_arg: str) -> Optional[str]:
         d = int(parts[0])
         m = int(parts[1])
         y = int(parts[2])
-        if y < 100:  # two-digit year -> 20YY
+        if y < 100:
             y += 2000
         dt = datetime(year=y, month=m, day=d)
         return dt.strftime("%Y-%m-%d")
@@ -544,7 +548,6 @@ def cmd_day(update: Update, context: CallbackContext):
         update.message.reply_text("No estás autorizado para ver el resumen del día.")
         return
 
-    # if no arg -> today
     if not context.args:
         target = datetime.now().strftime("%Y-%m-%d")
         human = datetime.now().strftime("%d/%m/%Y")
@@ -590,11 +593,10 @@ def main():
         print("No se proporcionó token. Exporta BOT_TOKEN o ingresalo al ejecutar.")
         return
 
-    # Crear Updater
     updater = Updater(token, use_context=True)
     dp = updater.dispatcher
 
-        # Handlers
+    # handlers
     dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("info", cmd_info))
     dp.add_handler(CommandHandler("iniciar", cmd_iniciar))
