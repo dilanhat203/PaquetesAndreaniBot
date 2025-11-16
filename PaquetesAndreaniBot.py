@@ -3,26 +3,20 @@
 
 """
 PaquetesAndreaniBot.py
-Bot de Telegram para contar paquetes por día y sumar pagos.
-Compatible con python-telegram-bot==13.15 (sincrónico)
-Diseñado para Termux + virtualenv + sqlite3.
-
-Características:
-- /start (registra hasta 2 owners)
-- /iniciar, /finalizar
-- aceptar '1' o 'paquete' para añadir paquete
-- teclados dinámicos + inline buttons
-- /tarifa <valor> (ARS)
-- /mes (resumen mensual)
-- /day [DD/MM/YY|DD/MM/YYYY] (resumen de día; sin arg => hoy)
-- /apagarbot con confirmación (solo owners)
-- pide TOKEN en consola si no existe variable BOT_TOKEN
+Versión corregida — soporta:
+- aceptar '1', 'paquete' -> suma 1
+- aceptar '-1' -> resta 1 (no baja de 0)
+- /resetdia -> elimina la jornada del día (solo owners)
+- inline buttons: +1, -1, eliminar jornada, finalizar, iniciar, mes
+- hasta 2 owners
+- /day [DD/MM/YY|DD/MM/YYYY] para ver resumen de cualquier día
+Compatible con python-telegram-bot==13.15
 """
 
 import os
 import sqlite3
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional
 
 from telegram import (
     Update,
@@ -184,22 +178,46 @@ def start_day(uid: int, date: str) -> bool:
 
 
 def add_package(uid: int, date: str, amount: int = 1) -> Optional[int]:
+    """
+    Añade (o resta si amount negativo) paquetes a la jornada del día.
+    Devuelve el nuevo total de paquetes, None si no hay jornada, o False si ya fue finalizada.
+    Se asegura de no bajar de 0 paquetes.
+    """
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, finished FROM days WHERE user_id=? AND date=?", (uid, date))
+    c.execute("SELECT id, packages, finished FROM days WHERE user_id=? AND date=?", (uid, date))
     r = c.fetchone()
     if not r:
         conn.close()
         return None
-    if r[1]:
+    if r[2]:
         conn.close()
         return False
-    c.execute("UPDATE days SET packages = packages + ? WHERE id=?", (amount, r[0]))
+    current = r[1]
+    new_val = current + int(amount)
+    if new_val < 0:
+        new_val = 0
+    c.execute("UPDATE days SET packages = ? WHERE id=?", (new_val, r[0]))
     conn.commit()
-    c.execute("SELECT packages FROM days WHERE id=?", (r[0],))
-    count = c.fetchone()[0]
     conn.close()
-    return count
+    return new_val
+
+
+def delete_day(uid: int, date: str) -> bool:
+    """
+    Elimina la fila de la jornada del día para el usuario. Devuelve True si borró algo.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id FROM days WHERE user_id=? AND date=?", (uid, date))
+    r = c.fetchone()
+    if not r:
+        conn.close()
+        return False
+    c.execute("DELETE FROM days WHERE id=?", (r[0],))
+    conn.commit()
+    conn.close()
+    return True
 
 
 def finish_day(uid: int, date: str):
@@ -237,21 +255,20 @@ def get_month_summary(uid: int, year: int, month: int):
 # ---------------- Keyboards ----------------
 def make_keyboard(active: bool = False) -> ReplyKeyboardMarkup:
     if active:
-        keys = [[KeyboardButton("1"), KeyboardButton("paquete")],
-                [KeyboardButton("/finalizar")],
-                [KeyboardButton("/mes")],
-                [KeyboardButton("/info")]]
+        keys = [[KeyboardButton("1"), KeyboardButton("-1"), KeyboardButton("paquete")],
+                [KeyboardButton("/finalizar"), KeyboardButton("/resetdia")],
+                [KeyboardButton("/mes"), KeyboardButton("/info")]]
     else:
         keys = [[KeyboardButton("/iniciar")],
-                [KeyboardButton("/mes")],
-                [KeyboardButton("/info")]]
+                [KeyboardButton("/mes"), KeyboardButton("/info")]]
     return ReplyKeyboardMarkup(keys, resize_keyboard=True)
 
 
 def make_inline_keyboard(active: bool = False) -> InlineKeyboardMarkup:
     if active:
         buttons = [
-            [InlineKeyboardButton("➕ Añadir paquete", callback_data="add_package")],
+            [InlineKeyboardButton("➕ Añadir paquete", callback_data="add_package"), InlineKeyboardButton("➖ Restar paquete", callback_data="sub_package")],
+            [InlineKeyboardButton("🗑️ Eliminar jornada", callback_data="delete_day")],
             [InlineKeyboardButton("⏹ Finalizar jornada", callback_data="finalizar")],
             [InlineKeyboardButton("📅 Resumen mes", callback_data="mes")],
         ]
@@ -289,9 +306,10 @@ def cmd_info(update: Update, context: CallbackContext):
         "/day DD/MM/YY o DD/MM/YYYY - ver resumen de la fecha indicada\n"
         "/mes - resumen del mes\n"
         "/tarifa <valor> - definir tarifa por paquete (en ARS)\n"
+        "/resetdia - eliminar la jornada del día (solo owners)\n"
         "/apagarbot - apagar bot (solo owners)\n"
         "/info - mostrar esta ayuda\n\n"
-        "Mientras la jornada esté activa, envía '1' o 'paquete' para sumar un paquete."
+        "Mientras la jornada esté activa, envía '1' o 'paquete' para sumar un paquete. Envía '-1' para restar uno."
     )
 
 
@@ -305,6 +323,8 @@ def cmd_iniciar(update: Update, context: CallbackContext):
     ok = start_day(uid, hoy)
     if ok:
         update.message.reply_text(f"Cristian, jornada iniciada para {hoy}.", reply_markup=make_keyboard(True))
+        # also show inline keyboard
+        update.message.reply_text("Acciones rápidas:", reply_markup=make_inline_keyboard(True))
     else:
         update.message.reply_text("Ya hay una jornada iniciada para hoy.", reply_markup=make_keyboard(True))
 
@@ -364,19 +384,18 @@ def cmd_tarifa(update: Update, context: CallbackContext):
     update.message.reply_text(f"Tarifa establecida en {v} ARS")
 
 
-# ---------------- Shutdown ----------------
-def cmd_apagarbot(update: Update, context: CallbackContext):
+# ---------------- Reset / delete day ----------------
+def cmd_resetdia(update: Update, context: CallbackContext):
     uid = update.message.from_user.id
     if not is_owner(uid):
-        update.message.reply_text("No estás autorizado para apagar el bot.")
+        update.message.reply_text("No estás autorizado para eliminar la jornada.")
         return
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("⚠️ Confirmar apagar bot ⚠️", callback_data="confirm_shutdown")],
-            [InlineKeyboardButton("❌ Cancelar", callback_data="cancel_shutdown")],
-        ]
-    )
-    update.message.reply_text("⚠️ APAGAR BOT ⚠️\nSi confirmas, el bot se detendrá. ¿Estás seguro?", reply_markup=keyboard)
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    ok = delete_day(uid, hoy)
+    if ok:
+        update.message.reply_text("Jornada del día eliminada. Puedes iniciar otra con /iniciar.", reply_markup=make_keyboard(False))
+    else:
+        update.message.reply_text("No había jornada para eliminar.", reply_markup=make_keyboard(False))
 
 
 # ---------------- Callbacks (inline) ----------------
@@ -386,7 +405,7 @@ def handle_callback(update: Update, context: CallbackContext):
     data = query.data
     query.answer()
 
-    protected = ("add_package", "finalizar", "iniciar", "mes", "confirm_shutdown", "shutdown")
+    protected = ("add_package", "sub_package", "delete_day", "finalizar", "iniciar", "mes", "confirm_shutdown", "shutdown")
     if data in protected and not is_owner(user_id):
         query.edit_message_text("No estás autorizado para esta acción.")
         return
@@ -402,6 +421,22 @@ def handle_callback(update: Update, context: CallbackContext):
         else:
             query.edit_message_text(f"Paquetes registrados hoy: {res}")
 
+    elif data == "sub_package":
+        res = add_package(user_id, today, -1)
+        if res is None:
+            query.edit_message_text("No hay jornada iniciada. Usa /iniciar para comenzar.")
+        elif res is False:
+            query.edit_message_text("La jornada ya fue finalizada, no se puede modificar.")
+        else:
+            query.edit_message_text(f"Paquetes registrados hoy: {res}")
+
+    elif data == "delete_day":
+        ok = delete_day(user_id, today)
+        if ok:
+            query.edit_message_text("Jornada del día eliminada.")
+        else:
+            query.edit_message_text("No había jornada para eliminar.")
+
     elif data == "finalizar":
         res = finish_day(user_id, today)
         if res is None:
@@ -412,9 +447,7 @@ def handle_callback(update: Update, context: CallbackContext):
             p = res["packages"]
             pago = res["pago"]
             tarifa = res["tarifa"]
-            query.edit_message_text(
-                f"Cristian, jornada finalizada. Paquetes: {p}\nTarifa por paquete: {tarifa} ARS\nPago total: {pago} ARS"
-            )
+            query.edit_message_text(f"Cristian, jornada finalizada. Paquetes: {p}\nTarifa por paquete: {tarifa} ARS\nPago total: {pago} ARS")
 
     elif data == "iniciar":
         ok = start_day(user_id, today)
@@ -462,15 +495,20 @@ def handle_text(update: Update, context: CallbackContext):
     uid = update.message.from_user.id
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # aceptar '1' o 'paquete' (case-insensitive)
-    if text.lower() not in ("1", "paquete"):
+    # aceptar '1', '-1' o 'paquete' (case-insensitive)
+    low = text.lower()
+    if low not in ("1", "paquete", "-1"):
         return
 
     if not is_owner(uid):
         update.message.reply_text("No estás autorizado para añadir paquetes.")
         return
 
-    res = add_package(uid, today, 1)
+    if low == "-1":
+        res = add_package(uid, today, -1)
+    else:
+        res = add_package(uid, today, 1)
+
     if res is None:
         update.message.reply_text("No hay jornada iniciada. Usa /iniciar para comenzar.", reply_markup=make_keyboard(False))
     elif res is False:
@@ -516,7 +554,6 @@ def cmd_day(update: Update, context: CallbackContext):
             update.message.reply_text("Formato de fecha inválido. Usar DD/MM/YY o DD/MM/YYYY (ej: /day 11/11/25).")
             return
         target = parsed
-        # create human readable
         try:
             dt = datetime.strptime(target, "%Y-%m-%d")
             human = dt.strftime("%d/%m/%Y")
@@ -557,7 +594,7 @@ def main():
     updater = Updater(token, use_context=True)
     dp = updater.dispatcher
 
-    # Handlers
+        # Handlers
     dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("info", cmd_info))
     dp.add_handler(CommandHandler("iniciar", cmd_iniciar))
@@ -565,6 +602,7 @@ def main():
     dp.add_handler(CommandHandler("day", cmd_day))
     dp.add_handler(CommandHandler("mes", cmd_mes))
     dp.add_handler(CommandHandler("tarifa", cmd_tarifa))
+    dp.add_handler(CommandHandler("resetdia", cmd_resetdia))
     dp.add_handler(CommandHandler("apagarbot", cmd_apagarbot))
 
     dp.add_handler(CallbackQueryHandler(handle_callback))
