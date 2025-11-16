@@ -571,7 +571,7 @@ def main():
     dp.add_handler(MessageHandler(Filters.text & (~Filters.command), handle_text))
 
     # store updater ref so callbacks can stop the bot
-    updater.bot_data["updater_ref"] = updater
+    updater.dispatcher.bot_data["updater_ref"] = updater
 
     print("Bot iniciado...")
     updater.start_polling()
